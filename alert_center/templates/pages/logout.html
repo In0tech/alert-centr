@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+    <title>Logout &mdash; Alert Center</title>
+    <style>
+        body.logout-page {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: var(--bg-primary);
+        }
+        .logout-card {
+            background-color: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            padding: 48px 40px;
+            width: 100%;
+            max-width: 420px;
+            text-align: center;
+            box-shadow: var(--shadow-md);
+        }
+        .logout-brand {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            font-size: 20px;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 24px;
+        }
+        .logout-brand i {
+            color: var(--accent-blue);
+            font-size: 24px;
+        }
+        .logout-card h3 {
+            color: var(--text-secondary);
+            font-weight: 500;
+            margin: 0 0 32px 0;
+            font-size: 16px;
+        }
+        .logout-actions {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            align-items: center;
+        }
+        .logout-secondary {
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+        .logout-secondary a {
+            color: var(--accent-blue);
+            text-decoration: none;
+            font-weight: 500;
+        }
+        .logout-secondary a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body class="logout-page">
+    <div class="logout-card">
+        <div class="logout-brand">
+            <i class="bi bi-shield-shaded"></i>
+            <span>Alert Center</span>
+        </div>
+        <h3>You have been logged out</h3>
+        <div class="logout-actions">
+            <a href="{{ url_for('pages.home') }}" class="btn">Back to Home</a>
+        </div>
+    </div>
+</body>
+</html>
+

@@ -1,0 +1,390 @@
+
+from flask import Flask, request, Response
+import asyncio
+import requests
+import json
+from datetime import timedelta
+import time 
+from datetime import datetime
+import sqlite3
+import clickhouse_connect
+import json
+
+import ipaddress
+
+import pandas as pd 
+
+DB_PATH = '/export/home/lvelueta/alert_center/dbs/mitigations.db'
+clickhouse_client = clickhouse_connect.get_client(host='localhost', port=8123, user='default', database='alert_center')
+
+genie_info_bot_token = 'SFMyNTY.g2gDbQAAACQ0MzA1MGJiZC04ZmUwLTU3ZGYtOTc5My00NzM3YzZlNWE3OTVuBgD6gI9qnAFiAAFRgA.D9MVMLSEDZP7Z8Np9AgbGVf0IdlgN-PltHfaOo9iWOg'
+buzz_csirt_chat_id = '31e5535f-f186-5be6-9656-69c4300a2ee5'
+buzz_url = "https://cts1.buzz.beeline.ru:4443/api/v4/botx/notifications/direct"
+
+
+
+
+
+def target_range_to_cidr(start_ip: str, end_ip: str) -> str:
+    start = ipaddress.IPv4Address(start_ip)
+    end = ipaddress.IPv4Address(end_ip)
+    total = int(end) - int(start) + 1
+    prefix = 32 - (total.bit_length() - 1)
+    net = ipaddress.IPv4Network(f"{start}/{prefix}", strict=False)
+    return str(net)
+
+
+
+def send_notification(url, token, chat_id, text, respond_to = None, rep_statistics = True):
+    headers = {
+        "authorization": f"Bearer {token}",
+        "content-type": "application/json",
+    }
+    
+    if respond_to:
+        reply_url = "https://cts1.buzz.beeline.ru:4443/api/v3/botx/events/reply_event"
+        payload = {
+            "source_sync_id": respond_to,
+            "reply": {
+                "status": "ok",
+                "body": text,
+            },
+            "opts": {},
+        }
+        try:
+            resp = requests.post(reply_url, headers=headers, data=json.dumps(payload), timeout=10)
+            resp.raise_for_status()
+            return resp.json()
+        except: pass # fallback to simple notification
+    
+    payload = {
+        "group_chat_id": chat_id,
+        "notification": {
+            "status": "ok",
+            "body": text,
+        },
+        "opts": {},
+    }
+
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+def check_db_for_sbh(sqlite3_cursor: sqlite3.Cursor):
+    sqlite3_cursor.execute('SELECT * FROM mitigations WHERE CURRENT_MITIGATION = "SBH"')
+    sbh_rows = sqlite3_cursor.fetchall()
+    if len(sbh_rows) > 0:
+        sbh_df = pd.DataFrame(sbh_rows, columns=['TARGET_CIDR', 'TARGET_NETWORK_INT', 'TARGET_BROADCAST_INT', 'CURRENT_MITIGATION', 'UPDATE_TIME_UNIX'])
+        return sbh_df
+    return pd.DataFrame() 
+
+def c_rounding(value, unit):
+    value = float(value)
+    if   value >= 1000000000:
+        return f"{(value/1000000000):.2f} G{unit}"
+    elif value >= 1000000:
+        return f"{(value/1000000):.2f} M{unit}"
+    #elif value > 1000:
+    return f"{(value/1000):.2f} K{unit}"
+
+def dedup_names(list):
+    #eturn str(lst)
+    
+    unique = set()
+    string = ""
+    for i in list:
+        unique.add(i)
+        
+    for name in unique:
+        string += f'{name}\n'
+    return string
+
+
+
+unique_id_condition = ''' (ID, UPDATE_TIME) IN (
+    SELECT ID, MAX(UPDATE_TIME) as UPDATE_TIME
+    FROM genie_events
+    GROUP BY ID
+) '''
+base_condition = f"{unique_id_condition} AND STATUS != 'Obsolete'"
+def get_last_related_genie_event_by_net(search_network, search_broadcast):
+    ''' returns last genie_events dataframe from genie db'''
+    
+    q = f"""
+SELECT ID, MAX_BPS, MAX_PPS, START_TIME, END_TIME, RESOURCE, TARGET_NETWORK, TARGET_BROADCAST FROM alert_center.genie_events 
+WHERE (( TARGET_NETWORK  <= '{search_network}'
+    AND TARGET_BROADCAST >= '{search_broadcast}'  AND END_TIME IS NULL  ) AND {base_condition} )
+ORDER BY START_TIME DESC LIMIT 1"""
+    db_res = clickhouse_client.query(q).result_rows
+    if len(db_res) == 0:
+        return pd.DataFrame()
+    df = pd.DataFrame(db_res, columns=['id', 'max_bps', 'max_pps','start_time', 'end_time', 'resource', 'target_network', 'target_broadcast'])
+    return df 
+
+
+def get_genie_event_by_net(search_network, search_broadcast):    
+    conditions = [
+        # exact match and is current
+f""" (( TARGET_BROADCAST = '{search_broadcast}' AND TARGET_NETWORK = '{search_network}' AND END_TIME IS NULL ) AND {base_condition}) """,
+
+        # fully contains net and is current
+f""" (( TARGET_BROADCAST >= '{search_broadcast}' AND TARGET_NETWORK <= '{search_network}' AND END_TIME IS NULL ) AND {base_condition}) """,
+
+        # intersects and is current
+f""" (( TARGET_BROADCAST >= '{search_network}' AND TARGET_NETWORK <= '{search_broadcast}' AND END_TIME IS NULL ) AND {base_condition}) """,
+
+        # fully contains net but is not current
+f""" (( TARGET_BROADCAST >= '{search_broadcast}' AND TARGET_NETWORK <= '{search_network}' ) AND {base_condition}) """,
+
+        # intersects but is not current
+f""" (( TARGET_BROADCAST >= '{search_network}' AND TARGET_NETWORK <= '{search_broadcast}' ) AND {base_condition}) """
+    ]
+
+    for condition in conditions:
+        query = f"""SELECT ID, MAX_BPS, MAX_PPS, START_TIME, END_TIME, RESOURCE, TARGET_NETWORK, TARGET_BROADCAST FROM alert_center.genie_events
+        WHERE {condition}
+        ORDER BY START_TIME DESC LIMIT 1
+        """ # better order by END_TIME. NULL behavior ??
+
+        db_res = clickhouse_client.query(query).result_rows
+        if len(db_res) > 0:
+            df = pd.DataFrame(db_res, columns=['id', 'max_bps', 'max_pps','start_time', 'end_time', 'resource', 'target_network', 'target_broadcast'])
+            return df
+    
+    return pd.DataFrame()
+
+
+
+def get_genie_event_by_id(genie_event_id):
+    q = f"""
+SELECT ID, MAX_BPS, MAX_PPS, START_TIME, END_TIME, RESOURCE, TARGET_NETWORK, TARGET_BROADCAST FROM alert_center.genie_events 
+WHERE ID = '{genie_event_id}' AND {base_condition}
+ORDER BY START_TIME DESC LIMIT 1"""
+    db_res = clickhouse_client.query(q).result_rows
+    if len(db_res) == 0:
+        return pd.DataFrame()
+    df = pd.DataFrame(db_res, columns=['id', 'max_bps', 'max_pps','start_time', 'end_time', 'resource', 'target_network', 'target_broadcast'])
+    return df
+
+
+"""def get_genie_events_open_text(genie_event, mitigation):
+    subnets = dedup_names(genie_event['resource'])
+    target_genie_cidr= f"{genie_event['target_network']} - {genie_event['target_broadcast']}"
+    beautified = \
+f'''🚨 Зафиксирована DDOS атака
+🎫 ID События:
+{genie_event['id']}
+
+🎯 Target:
+{target_genie_cidr}
+
+📍 Sub-network:
+{subnets}
+
+📈 Пиковые значения:
+{c_rounding(genie_event['max_bps'], 'bps')}
+{c_rounding(genie_event['max_pps'], 'pps')}
+
+🕐 Начало атаки:
+{genie_event['start_time']}
+
+🛡️ Принимаемые меры защиты:
+SBH
+'''
+    return beautified 
+
+def get_genie_events_closed_text(genie_event):
+    time_str = f"{genie_event['end_time'] - genie_event['start_time']} seconds"
+    target_genie_cidr= f"{genie_event['target_network']} - {genie_event['target_broadcast']}"
+    
+    beautified = \
+f'''✅ Аномалия окончена
+🎫 ID События:
+{genie_event['id']}
+
+🎯 Target:
+{target_genie_cidr}
+
+📈 Пиковые значения:
+{c_rounding(genie_event['max_bps'], 'bps')}
+{c_rounding(genie_event['max_pps'], 'pps')}
+
+🕐 Продолжительность аномалии:
+{time_str}
+
+🕐 Конец атаки:
+{genie_event['end_time']}
+'''         
+    return beautified"""
+
+def collapse_networks(df: pd.DataFrame) -> list:
+    records = []
+    for _, row in df.iterrows():
+        #start_ip_int = int(ipaddress.ip_address(row['TARGET_NETWORK_INT']))
+        #end_ip_int = int(ipaddress.ip_address(row['TARGET_BROADCAST_INT']))
+        records.append({
+            'start_ip_int': row['TARGET_NETWORK_INT'],
+            'end_ip_int': row['TARGET_BROADCAST_INT'],
+            'subnets': []
+        })
+
+    if not records:
+        return []
+
+    records.sort(key=lambda x: x['start_ip_int'])
+
+
+    merged_records = []
+    current = records[0]
+    current['subnets'].extend((current['start_ip_int'], current['end_ip_int']))
+
+    for record in records[1:]:
+        if record['start_ip_int'] <= current['end_ip_int']+1:  # +1 to extend adjacent networks
+            current['subnets'].extend((record['start_ip_int'], record['end_ip_int']))
+            current['end_ip_int'] = max(current['end_ip_int'], record['end_ip_int'])
+        else:
+            merged_records.append(current)
+            current = record
+
+    merged_records.append(current)
+
+
+    res = []
+    for record in merged_records:
+        start_ip = ipaddress.ip_address(record['start_ip_int'])
+        end_ip = ipaddress.ip_address(record['end_ip_int'])
+        res.append((str(start_ip), str(end_ip)))
+
+    return res
+
+CURRENT_OPEN_NOTIFICATIONS = {} # mitigation_cidr : {genie_event_id , sync_id}
+
+def close_notifications(current_sbh):
+    global CURRENT_OPEN_NOTIFICATIONS
+    remove_ranges = []    
+
+    for target_range in CURRENT_OPEN_NOTIFICATIONS.keys():
+        if target_range not in current_sbh:
+            #genie_event_id = CURRENT_OPEN_NOTIFICATIONS[target_range]['genie_event_id']
+            #genie_event: pd.DataFrame = get_genie_event_by_id(genie_event_id)
+            
+            #if genie_event.empty:
+            #    print(f"Genie event {genie_event_id} not found")
+            #    exit(1)
+            
+            #genie_event_text = get_genie_events_closed_text(genie_event.iloc[0])
+            
+            print(f'Sending close <<<<<<< for {target_range}')
+            genie_event_text = f"✅ Митигация окончена {target_range_to_cidr(*target_range)} "
+            send_notification(buzz_url, genie_info_bot_token, buzz_csirt_chat_id, genie_event_text, CURRENT_OPEN_NOTIFICATIONS[target_range]['sync_id'])
+            remove_ranges.append(target_range)
+            
+    for range in remove_ranges:
+        del CURRENT_OPEN_NOTIFICATIONS[target_range]
+                
+                
+
+def main():
+    global CURRENT_OPEN_NOTIFICATIONS
+    while True:
+        sqlite3_connection = sqlite3.connect(DB_PATH)
+        sqlite3_cursor  = sqlite3_connection.cursor()
+        
+        sbh_df: pd.DataFrame = check_db_for_sbh(sqlite3_cursor)
+        
+        print(f"sbh_df size: {sbh_df}")
+        
+        
+        if not sbh_df.empty:    
+            ########## collapse sbh_df
+            sbh_ranges = collapse_networks(sbh_df)
+            
+            close_notifications(sbh_ranges)
+            
+            
+            for start_ip, end_ip in sbh_ranges:
+                #print(f"+++++++++++++++++++++++++\nSBH_ROW:{start_ip} - {end_ip}\n\n")
+                target_range = (start_ip, end_ip)
+                                
+                ################## New notification
+                if target_range not in CURRENT_OPEN_NOTIFICATIONS.keys():
+                    '''genie_event: pd.DataFrame = get_last_related_genie_event_by_net(target_network, target_broadcast)
+                                        
+                    if genie_event.empty: 
+                        continue
+
+                    print(f"Related genie event: {genie_event.iloc[0]}  -- {target_cidr}")
+
+                    # if genie even is already related to another notification, then skip
+                    for v in CURRENT_OPEN_NOTIFICATIONS.values():
+                        if v['genie_event_id'] == genie_event.iloc[0]['id']:
+                            continue
+
+                    
+                    genie_event_text = get_genie_events_open_text(genie_event.iloc[0], current_mitigation)#'''
+                    
+                    # get genie event with exact overlap or larger, current or latest
+                    event_df = get_genie_event_by_net(target_range[0], target_range[1])  #  *target_range
+                    #print(event_df)
+                    if event_df.empty: event = 'No genie events found' 
+                    else: event = event_df.iloc[0]   
+
+                            
+                    genie_event_text = f"""⚔️ Митигация (SBH) начата по {target_range_to_cidr(*target_range)}
+Лучшее совпадение:
+🎫 ID События:
+{event['id']}
+
+📈 Параметры атаки:
+Max BPS: {c_rounding(event['max_bps'], 'bps')}
+Max PPS: {c_rounding(event['max_pps'], 'pps')}
+
+📍 Sub-network:
+{dedup_names(event['resource'])}
+
+🕐 Начало атаки:
+{event['start_time']}
+"""
+                    
+                    res = send_notification(buzz_url, genie_info_bot_token, buzz_csirt_chat_id, genie_event_text)
+                    
+                    print('Sending open    >>>>>>')
+                    
+                    CURRENT_OPEN_NOTIFICATIONS[target_range] = \
+                        {'genie_event_id': 1,#genie_event.iloc[0]['id'],
+                         'sync_id': res['result']['sync_id']}
+                    
+                    
+        ################### Close notifications
+        
+        '''to_remove = []
+        for mitig_data in CURRENT_OPEN_NOTIFICATIONS.values():
+            # if in CURRENT_OPEN_NOTIFICATIONS and ended, then close notification
+            genie_event_id = mitig_data['genie_event_id']
+            genie_event: pd.DataFrame = get_genie_event_by_id(genie_event_id)
+            
+            if genie_event.empty:
+                print(f"Genie event {genie_event_id} not found")
+                exit(1)
+            
+            if pd.isna(genie_event.iloc[0]['end_time']):
+                continue
+            
+            print(f"Genie event {genie_event_id} ended, sending close")
+            
+            genie_event_text = get_genie_events_closed_text(genie_event.iloc[0])
+            send_notification(buzz_url, genie_info_bot_token, buzz_csirt_chat_id, genie_event_text, mitig_data['sync_id'])
+            to_remove.append(genie_event_id)
+            
+        for genie_event_id in to_remove:
+            del CURRENT_OPEN_NOTIFICATIONS[target_cidr]#'''
+            
+        sqlite3_connection.commit()
+        sqlite3_connection.close()
+            
+        time.sleep(10)
+        
+
+    
+if __name__ == "__main__":
+    main()

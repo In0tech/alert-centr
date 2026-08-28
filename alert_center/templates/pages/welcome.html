@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+
+{% block title %} Home {% endblock %}
+
+{% block body_class %}welcome-page{% endblock %}
+
+{% block header %}
+  <div class="welcome-hero"></div>
+    <div class="welcome-brand">
+      <i class="bi bi-shield-shaded"></i>
+      <span>ADDOS Alert Center</span>
+    </div>
+  </div>
+{% endblock %}
+
+{% block content %}
+  <div class="welcome-grid">
+
+    <a class="welcome-card" href="{{ url_for('pages.alerts') }}">
+      <div class="welcome-card-icon"><i class="bi bi-table"></i></div>
+      <div class="welcome-card-body">
+        <div class="welcome-card-title">Алерты</div>
+        <div class="welcome-card-desc">Актуальная таблица алертов и митигаций</div>
+      </div>
+      {% if open_alerts is not none %}
+        <span class="count-badge count-badge-red">{{ open_alerts }} откр.</span>
+      {% else %}
+        <span class="count-badge count-badge-muted">&mdash;</span>
+      {% endif %}
+    </a>
+
+    <a class="welcome-card" href="{{ url_for('pages.search') }}">
+      <div class="welcome-card-icon"><i class="bi bi-search"></i></div>
+      <div class="welcome-card-body">
+        <div class="welcome-card-title">Поиск</div>
+        <div class="welcome-card-desc">Поиск по разным источникам</div>
+      </div>
+    </a>
+
+    <a class="welcome-card" href="{{ url_for('pages.db_assist') }}">
+      <div class="welcome-card-icon"><i class="bi bi-robot"></i></div>
+      <div class="welcome-card-body">
+        <div class="welcome-card-title">ИИ-ассистент</div>
+        <div class="welcome-card-desc">Запросы к БД на человеческом</div>
+      </div>
+    </a>
+
+    <a class="welcome-card" href="{{ url_for('pages.genie') }}">
+      <div class="welcome-card-icon"><i class="bi bi-activity"></i></div>
+      <div class="welcome-card-body">
+        <div class="welcome-card-title">Genie</div>
+        <div class="welcome-card-desc">Сырые события Genie</div>
+      </div>
+      {% if genie_events_24h is not none %}
+        <span class="count-badge count-badge-blue">{{ genie_events_24h }} / 24h</span>
+      {% else %}
+        <span class="count-badge count-badge-muted">&mdash;</span>
+      {% endif %}
+    </a>
+
+    <a class="welcome-card" href="{{ url_for('pages.reports') }}">
+      <div class="welcome-card-icon"><i class="bi bi-file-earmark-bar-graph"></i></div>
+      <div class="welcome-card-body">
+        <div class="welcome-card-title">Отчёты</div>
+        <div class="welcome-card-desc">Сводные отчёты за период</div>
+      </div>
+    </a>
+
+    <a class="welcome-card" href="{{ url_for('pages.metrics') }}">
+      <div class="welcome-card-icon"><i class="bi bi-speedometer2"></i></div>
+      <div class="welcome-card-body">
+        <div class="welcome-card-title">Метрики</div>
+        <div class="welcome-card-desc">Метрики результатов за период</div>
+      </div>
+    </a>
+
+  </div>
+
+  <div class="welcome-stats-row">
+    <div class="welcome-stat">
+      <span class="welcome-stat-label">Активные митигации</span>
+      <span class="welcome-stat-value">
+        {% if active_mitigations is not none %}{{ active_mitigations }}{% else %}&mdash;{% endif %}
+      </span>
+    </div>
+    <div class="welcome-stat">
+      <span class="welcome-stat-label">Активные объекты Kuma</span>
+      <span class="welcome-stat-value">
+        {% if kuma_probes is not none %}{{ kuma_probes }}{% else %}&mdash;{% endif %}
+      </span>
+    </div>
+  </div>
+
+  <div class="welcome-external-section">
+    <div class="welcome-external-title">
+      <i class="bi bi-box-arrow-up-right"></i>
+      <span>Внешние инструменты</span>
+    </div>
+    <div class="welcome-external-grid">
+      <a class="welcome-external-card" href="https://flow-collect.antiddos-test.cloud.vimpelcom.ru:8000/index" target="_blank" rel="noopener noreferrer">
+        <i class="bi bi-cloud-arrow-down"></i>
+        <span>Flow Collector</span>
+        <i class="bi bi-box-arrow-up-right welcome-external-external-icon"></i>
+      </a>
+      <a class="welcome-external-card" href="http://flow-collect.antiddos-test.cloud.vimpelcom.ru:5000/" target="_blank" rel="noopener noreferrer">
+        <i class="bi bi-shuffle"></i>
+        <span>Traffic swapper</span>
+        <i class="bi bi-box-arrow-up-right welcome-external-external-icon"></i>
+      </a>
+      <a class="welcome-external-card" href="https://inside.beeline.ru/d/oRQE6tfIk" target="_blank" rel="noopener noreferrer">
+        <i class="bi bi-graph-up"></i>
+        <span>Grafana</span>
+        <i class="bi bi-box-arrow-up-right welcome-external-external-icon"></i>
+      </a>
+      <a class="welcome-external-card" href="https://antiddos.beeline.ru/events" target="_blank" rel="noopener noreferrer">
+        <i class="bi bi-cpu"></i>
+        <span>Cyber-Controller</span>
+        <i class="bi bi-box-arrow-up-right welcome-external-external-icon"></i>
+      </a>
+      <a class="welcome-external-card" href="https://frontend.mgmt-system-econ.vimpelcom.ru/" target="_blank" rel="noopener noreferrer">
+        <i class="bi bi-sliders"></i>
+        <span>Система Управления ЭКОН</span>
+        <i class="bi bi-box-arrow-up-right welcome-external-external-icon"></i>
+      </a>
+    </div>
+  </div>
+{% endblock %}
+

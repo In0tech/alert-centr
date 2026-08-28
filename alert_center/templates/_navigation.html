@@ -1,0 +1,21 @@
+<nav>
+    <div class="nav-brand">
+        <a href="{{ url_for('pages.home') }}" class="nav-brand-link">Alert Center ADDOS</a>
+    </div>
+    <ul>
+      <li><a href="{{ url_for('pages.home') }}">Home</a></li>
+      <li><a href="{{ url_for('pages.alerts') }}">Alerts</a></li>
+      <li><a href="{{ url_for('pages.search') }}">Search</a></li>
+      <li><a href="{{ url_for('pages.db_assist') }}">AI tech assist</a></li>
+      <li><a href="{{ url_for('pages.genie') }}">Genie</a></li>
+      <li><a href="{{ url_for('pages.reports') }}">Reports</a></li>
+      <li><a href="{{ url_for('pages.metrics') }}">Metrics</a></li>
+      <li><a href="https://flow-collect.antiddos-test.cloud.vimpelcom.ru:8000/index">Flow Collector</a></li>
+      <li><a href="http://flow-collect.antiddos-test.cloud.vimpelcom.ru:5000/">Traffic swapper</a></li>
+      <li><a href="https://inside.beeline.ru/d/oRQE6tfIk">Grafana</a></li>
+      <li><a href="https://antiddos.beeline.ru/events">Cyber-Controller</a></li>
+      <li><a href="https://frontend.mgmt-system-econ.vimpelcom.ru/" target="_blank" rel="noopener noreferrer">Система Управления ЭКОН</a></li>
+      <li><a href="{{ url_for('auth_pages.logout') }}">Logout</a></li>
+    </ul>
+</nav>
+

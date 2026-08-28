@@ -1,0 +1,801 @@
+from io import BytesIO
+import textwrap
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Flowable
+from reportlab.pdfbase import pdfmetrics
+from reportlab.graphics.shapes import Drawing, Rect
+from reportlab.graphics.charts.barcharts import VerticalBarChart, HorizontalBarChart
+from reportlab.graphics.charts.piecharts import Pie
+
+from services.utils import c_rounding, sec_to_str, resolve_ip
+from services.data_fetcher import (
+    get_b2b_summary,
+    get_vc_it_genie_summary,
+    get_shpd_genie_summary,
+    get_top_radware_summary,
+    get_top_policies_summary,
+    clickhouse_client,
+    time_filter_sql,
+    unique_id_condition,
+    opensearch_client,
+    time_to_filter,
+)
+
+from alert_center.views.reports_pdf import (
+    _ensure_cyrillic_font,
+    _cyr_styles,
+    _on_page,
+    _to_paragraph,
+    _kv_cell_style,
+    _grid_table,
+    BG_HEADER,
+    BG_ROW_ODD,
+    BG_ROW_EVEN,
+    BG_FRAME,
+    GRID_COLOR,
+    TEXT_MAIN,
+    TEXT_MUTED,
+    ACCENT_CYAN,
+    ACCENT_ORANGE,
+    ACCENT_BLUE,
+    STR_BIN,
+    STR_PCT_TOTAL,
+    STR_NO_DATA,
+)
+
+
+STR_NO_DATA = 'Нет данных'
+STR_TITLE = 'Отчёт ADDOS'
+STR_TIME_RANGE = 'Период'
+STR_SIGNIFICANT_ACTIVITIES = 'Значимые активности:'
+
+STR_COL_TOTAL = 'Атак всего'
+STR_COL_VC = 'Атак на ВК'
+STR_COL_B2B = 'Атак на b2b'
+STR_COL_FTTB = 'Атак на FTTB'
+STR_COL_SERVICES = 'Сервисов под защитой'
+
+STR_MOST_POWERFUL = 'Самая мощная'
+STR_LONGEST = 'Самая длительная'
+
+STR_TOP_RESOURCES = 'Топ атакуемых ресурсов'
+STR_TOP_SOURCES = 'Топ источников атак'
+STR_TOP_DURATION = 'ТОП атак по длительности'
+STR_TOP_BPS = 'ТОП атак по BPS'
+STR_TOP_POLICIES = 'Распределение атак по политикам'
+
+# Palette for pie chart slices (rotates through these)
+_PIE_COLORS = [
+    colors.HexColor('#9b59b6'),
+    colors.HexColor('#2ecc71'),
+    colors.HexColor('#e74c3c'),
+    colors.HexColor('#f1c40f'),
+    colors.HexColor('#34495e'),
+    colors.HexColor('#7f8c8d'),
+    colors.HexColor("#7d8332"),
+    colors.HexColor("#13D5DB"),
+    colors.HexColor("#0905F7"),
+    colors.HexColor("#f76300"),
+]
+
+
+class _ActivitiesTableFlowable(Flowable):
+    """Single Flowable that draws a 5-row editable grid for the
+    'Значимые активности' section. Drawing the grid lines AND registering
+    all acroForm textfields in one draw() call keeps the canvas transform
+    consistent so each field lands inside its own row (instead of
+    collapsing to the page bottom, which happens when each cell is a
+    separate Flowable inside a Table)."""
+
+    def __init__(self, font_name, width=515, row_height=50, n_rows=5):
+        super().__init__()
+        self.font_name = font_name
+        self.width = width
+        self.row_height = row_height
+        self.n_rows = n_rows
+        self.height = row_height * n_rows
+
+    def wrap(self, availWidth, availHeight):
+        return self.width, self.height
+
+    def draw(self):
+        canv = self.canv
+        rh = self.row_height
+        n = self.n_rows
+        w = self.width
+
+        # rect()/grid() honor the canvas transform stack, so they draw at
+        # the flowable's position using flowable-relative coords. acroForm
+        # textfields do NOT — they place fields in absolute page coords, so
+        # we resolve the flowable origin via absolutePosition().
+        x0, y0 = canv.absolutePosition(0, 0)
+
+        for i in range(n):
+            bg = BG_ROW_ODD if i % 2 == 1 else BG_ROW_EVEN
+            canv.setFillColor(bg)
+            canv.setStrokeColor(GRID_COLOR)
+            canv.setLineWidth(0.5)
+            canv.rect(0, i * rh, w, rh, stroke=1, fill=1)
+
+        canv.setStrokeColor(GRID_COLOR)
+        canv.setLineWidth(0.5)
+        canv.grid([0, w], [0] + [j * rh for j in range(n + 1)])
+
+        # Row 0 is the top row visually; map activities_0..n-1 top-to-bottom.
+        for i in range(n):
+            canv.acroForm.textfield(
+                name=f'activities_{i}',
+                x=x0, y=y0 + (n - 1 - i) * rh,
+                width=w, height=rh,
+                fontName='Helvetica', fontSize=9,
+                fillColor=BG_ROW_EVEN,
+                borderColor=GRID_COLOR, borderWidth=0.5,
+                borderStyle='solid',
+                fieldFlags='multiline',
+                value='',
+                forceBorder=False,
+            )
+
+
+def _attack_desc(record, kind='bps'):
+    """Compact multiline description of an attack record."""
+    if not record:
+        return STR_NO_DATA
+    lines = []
+    target = record.get('target', '')
+    if target:
+        lines.append(str(target))
+    max_bps = record.get('max_bps')
+    max_pps = record.get('max_pps')
+    if max_bps is not None or max_pps is not None:
+        bps_str = c_rounding(max_bps, 'bps') if max_bps is not None else '-'
+        pps_str = c_rounding(max_pps, 'pps') if max_pps is not None else '-'
+        lines.append(f"{bps_str} / {pps_str}")
+    start_time = record.get('start_time')
+    end_time = record.get('end_time')
+    if start_time is not None:
+        start_str = str(start_time).replace('T', ' ')
+        end_str = str(end_time).replace('T', ' ') if end_time is not None else '...'
+        lines.append(f"{start_str} -> {end_str}")
+    if kind == 'duration':
+        duration = record.get('duration')
+        if duration is not None:
+            lines.append(f"Длительность: {sec_to_str(duration)}")
+    return '\n'.join(lines)
+
+
+def _normalize_attack_record(rec):
+    """Pass through attack record fields unchanged; display formatting is
+    done by _attack_desc. Mirrors services.data_fetcher._normalize_attack_record."""
+    if not rec:
+        return None
+    return dict(rec)
+
+
+def _build_summary_grid_table(total, vc_count, b2b_count, fttb_count,
+                              vc_biggest, vc_longest,
+                              b2b_biggest, b2b_longest,
+                              fttb_biggest, fttb_longest, font_name):
+    """Build the 5-column x 6-row summary grid table."""
+    cell_style = _kv_cell_style(font_name)
+    bold_name = (font_name + '-Bold') if (font_name + '-Bold') in pdfmetrics.getRegisteredFontNames() else font_name
+    hdr_style = ParagraphStyle(
+        'grid_hdr_alt',
+        fontName=bold_name,
+        fontSize=9, leading=11, textColor=TEXT_MAIN, alignment=1,
+    )
+
+    def cell(value):
+        if value == '' or value is None:
+            return ''
+        return _to_paragraph(value, font_name, cell_style)
+
+    header_row = [
+        Paragraph(STR_COL_TOTAL, hdr_style),
+        Paragraph(STR_COL_VC, hdr_style),
+        Paragraph(STR_COL_B2B, hdr_style),
+        Paragraph(STR_COL_FTTB, hdr_style),
+        #Paragraph(STR_COL_SERVICES, hdr_style),
+    ]
+
+    rows = [
+        header_row,
+        [
+            cell(str(total) if total is not None else ''),
+            cell(str(vc_count) if vc_count is not None else ''),
+            cell(str(b2b_count) if b2b_count is not None else ''),
+            cell(str(fttb_count) if fttb_count is not None else ''),
+            #cell(''),
+        ],
+        [
+            cell(''),
+            cell(STR_MOST_POWERFUL),
+            cell(STR_MOST_POWERFUL),
+            cell(STR_MOST_POWERFUL),
+            #cell(''),
+        ],
+        [
+            cell(''),
+            cell(_attack_desc(vc_biggest, 'bps')),
+            cell(_attack_desc(b2b_biggest, 'bps')),
+            cell(_attack_desc(fttb_biggest, 'bps')),
+            #cell(''),
+        ],
+        [
+            cell(''),
+            cell(STR_LONGEST),
+            cell(STR_LONGEST),
+            cell(STR_LONGEST),
+            #cell(''),
+        ],
+        [
+            cell(''),
+            cell(_attack_desc(vc_longest, 'duration')),
+            cell(_attack_desc(b2b_longest, 'duration')),
+            cell(_attack_desc(fttb_longest, 'duration')),
+            #cell(''),
+        ],
+    ]
+
+    col_widths = [80, 140, 140, 140, 80]
+
+    style = TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), BG_HEADER),
+        ('GRID', (0, 0), (-1, -1), 0.5, GRID_COLOR),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+    ])
+    for i in range(1, len(rows)):
+        bg = BG_ROW_ODD if (i - 1) % 2 == 1 else BG_ROW_EVEN
+        style.add('BACKGROUND', (0, i), (-1, i), bg)
+
+    tbl = Table(rows, colWidths=col_widths)
+    tbl.setStyle(style)
+    return tbl
+
+
+def _build_empty_activities_table(font_name):
+    """Editable 5-row grid for the 'Значимые активности' section.
+    Returns a single Flowable that draws the grid + all acroForm fields
+    in one draw() call so the fields land inside the table (not at the
+    page bottom)."""
+    return _ActivitiesTableFlowable(font_name, width=515, row_height=50, n_rows=5)
+
+
+def _fetch_all_duration_histogram(start_iso, end_iso=None):
+    """Build the duration histogram (8 bins) over ALL genie_events in the
+    window — no resource filter applied. Mirrors the duration_histogram
+    section of services.data_fetcher._build_extra_stats, but with the
+    bare time_filter as the only condition.
+    Returns a list of {'label','count','pkt'} dicts, or None if no data.
+    """
+    time_filter = time_filter_sql(start_iso, end_iso)
+    conditions = f"({time_filter})"
+
+    duration_formula = ("if(isNull(END_TIME), "
+                         "dateDiff('second', START_TIME, now()), "
+                         "dateDiff('second', START_TIME, END_TIME))")
+
+    dur_bins_labels = [
+        '\u22641 min', '1-5 min', '5-10 min', '10-20 min',
+        '20-30 min', '30-60 min', '1-10 h', '>10 h',
+    ]
+    dur_hist_query = f"""
+        SELECT
+            count() AS total,
+            countIf(duration <= 60) AS c0,
+            countIf(duration > 60 AND duration < 300) AS c1,
+            countIf(duration >= 300 AND duration < 600) AS c2,
+            countIf(duration >= 600 AND duration < 1200) AS c3,
+            countIf(duration >= 1200 AND duration < 1800) AS c4,
+            countIf(duration >= 1800 AND duration < 3600) AS c5,
+            countIf(duration >= 3600 AND duration < 36000) AS c6,
+            countIf(duration >= 36000) AS c7
+        FROM (
+            SELECT {duration_formula} AS duration
+            FROM genie_events
+            WHERE {conditions} AND {unique_id_condition}
+        )
+    """
+    dur_hist_result = clickhouse_client.query(dur_hist_query).result_rows
+    if not dur_hist_result:
+        return None
+    row = dur_hist_result[0]
+    total = row[0] or 0
+    if not total:
+        return None
+    dh = []
+    for i, label in enumerate(dur_bins_labels):
+        cnt = row[i + 1] or 0
+        dh.append({'label': label, 'count': cnt,
+                   'pkt': round(cnt / total * 100, 1)})
+    return dh
+
+
+def _fetch_all_bps_histogram(start_iso, end_iso=None):
+    """Build the BPS histogram (11 bins) over ALL genie_events in the
+    window — no resource filter applied. Mirrors the bps_histogram
+    section of services.data_fetcher._build_extra_stats, but with the
+    bare time_filter as the only condition.
+    Returns a list of {'label','count','pkt'} dicts, or None if no data.
+    """
+    time_filter = time_filter_sql(start_iso, end_iso)
+    conditions = f"({time_filter})"
+
+    bps_bins_labels = [
+        '<1 Mbps', '1-10 Mbps', '10-100 Mbps', '100-500 Mbps',
+        '500M-1 Gbps', '1-2 Gbps', '2-3 Gbps', '3-4 Gbps',
+        '4-5 Gbps', '5-10 Gbps', '>10 Gbps',
+    ]
+    bps_hist_query = f"""
+        SELECT
+            count() AS total,
+            countIf(MAX_BPS < 1e6) AS c0,
+            countIf(MAX_BPS >= 1e6 AND MAX_BPS < 1e7) AS c1,
+            countIf(MAX_BPS >= 1e7 AND MAX_BPS < 1e8) AS c2,
+            countIf(MAX_BPS >= 1e8 AND MAX_BPS < 5e8) AS c3,
+            countIf(MAX_BPS >= 5e8 AND MAX_BPS < 1e9) AS c4,
+            countIf(MAX_BPS >= 1e9 AND MAX_BPS < 2e9) AS c5,
+            countIf(MAX_BPS >= 2e9 AND MAX_BPS < 3e9) AS c6,
+            countIf(MAX_BPS >= 3e9 AND MAX_BPS < 4e9) AS c7,
+            countIf(MAX_BPS >= 4e9 AND MAX_BPS < 5e9) AS c8,
+            countIf(MAX_BPS >= 5e9 AND MAX_BPS < 1e10) AS c9,
+            countIf(MAX_BPS >= 1e10) AS c10
+        FROM genie_events
+        WHERE {conditions} AND {unique_id_condition}
+    """
+    bps_hist_result = clickhouse_client.query(bps_hist_query).result_rows
+    if not bps_hist_result:
+        return None
+    row = bps_hist_result[0]
+    total = row[0] or 0
+    if not total:
+        return None
+    bh = []
+    for i, label in enumerate(bps_bins_labels):
+        cnt = row[i + 1] or 0
+        bh.append({'label': label, 'count': cnt,
+                   'pkt': round(cnt / total * 100, 1)})
+    return bh
+
+
+def _build_duration_hist_drawing(bins, font_name):
+    """Vertical bar chart for the duration histogram over all attacks.
+    Mirrors _hist_drawing in reports_pdf.py (ACCENT_BLUE bars)."""
+    labels = [b.get('label', '') for b in bins[::-1]]
+    values = [b.get('pkt', 0) for b in bins[::-1]]
+    n = len(labels)
+    width = 500
+    height = 350#180
+    drawing = Drawing(width, height)
+    drawing.add(Rect(0, 0, width, height, fillColor=BG_FRAME, strokeColor=None))
+    chart = HorizontalBarChart()
+    chart.x = 50
+    chart.y = 30
+    chart.width = width - 70
+    chart.height = height - 55
+    chart.data = [values]
+    chart.bars[0].fillColor = ACCENT_BLUE
+    chart.bars[0].strokeColor = ACCENT_BLUE
+    chart.barWidth = max(2, (chart.width / max(n, 1)) * 0.6)
+    chart.groupSpacing = 4
+    chart.valueAxis.valueMin = 0
+    chart.valueAxis.valueMax = max(values) * 1.15 if values else 1
+    chart.valueAxis.valueStep = max(1, round(chart.valueAxis.valueMax / 5))
+    chart.valueAxis.labelTextFormat = '%d%%'
+    chart.valueAxis.labels.fontName = font_name
+    chart.valueAxis.labels.fontSize = 7
+    chart.valueAxis.labels.fillColor = TEXT_MUTED
+    chart.valueAxis.strokeColor = GRID_COLOR
+    chart.valueAxis.gridStrokeColor = GRID_COLOR
+    chart.categoryAxis.categoryNames = labels
+    chart.categoryAxis.labels.fontName = font_name
+    chart.categoryAxis.labels.fontSize = 7
+    chart.categoryAxis.labels.fillColor = TEXT_MUTED
+    chart.categoryAxis.labels.boxAnchor = 'ne'
+    chart.categoryAxis.labels.dy = 2
+    chart.categoryAxis.strokeColor = GRID_COLOR
+    drawing.add(chart)
+    return drawing
+
+
+def _build_bps_hist_drawing(bins, font_name):
+    """Horizontal bar chart for the BPS histogram over all attacks.
+    Mirrors _build_duration_hist_drawing but uses ACCENT_BLUE bars."""
+    labels = [b.get('label', '') for b in bins[::-1]]
+    values = [b.get('pkt', 0) for b in bins[::-1]]
+    n = len(labels)
+    width = 500
+    height = 350
+    drawing = Drawing(width, height)
+    drawing.add(Rect(0, 0, width, height, fillColor=BG_FRAME, strokeColor=None))
+    chart = HorizontalBarChart()
+    chart.x = 65
+    chart.y = 30
+    chart.width = width - 70
+    chart.height = height - 55
+    chart.data = [values]
+    chart.bars[0].fillColor = ACCENT_BLUE
+    chart.bars[0].strokeColor = ACCENT_BLUE
+    chart.barWidth = max(2, (chart.width / max(n, 1)) * 0.6)
+    chart.groupSpacing = 4
+    chart.valueAxis.valueMin = 0
+    chart.valueAxis.valueMax = max(values) * 1.15 if values else 1
+    chart.valueAxis.valueStep = max(1, round(chart.valueAxis.valueMax / 5))
+    chart.valueAxis.labelTextFormat = '%d%%'
+    chart.valueAxis.labels.fontName = font_name
+    chart.valueAxis.labels.fontSize = 7
+    chart.valueAxis.labels.fillColor = TEXT_MUTED
+    chart.valueAxis.strokeColor = GRID_COLOR
+    chart.valueAxis.gridStrokeColor = GRID_COLOR
+    chart.categoryAxis.categoryNames = labels
+    chart.categoryAxis.labels.fontName = font_name
+    chart.categoryAxis.labels.fontSize = 7
+    chart.categoryAxis.labels.fillColor = TEXT_MUTED
+    chart.categoryAxis.labels.boxAnchor = 'ne'
+    chart.categoryAxis.labels.dy = 2
+    chart.categoryAxis.strokeColor = GRID_COLOR
+    drawing.add(chart)
+    return drawing
+
+
+def _build_policies_hist_drawing(buckets, font_name):
+    """Horizontal bar chart for top policies by document count over the DP
+    index. Mirrors _build_duration_hist_drawing but uses policy names as
+    category labels and ACCENT_BLUE bars. Values are percent of the
+    returned buckets' total doc_count."""
+    if not buckets:
+        return None
+    total = sum(b.get('doc_count', 0) for b in buckets) or 1
+    rev = buckets[::-1]
+
+    def _wrap_policy(name, width=25, max_lines=2):
+        wrapped = textwrap.wrap(str(name), width=width)
+        if len(wrapped) > max_lines:
+            wrapped = wrapped[:max_lines]
+            wrapped[-1] = wrapped[-1][:width - 1] + '\u2026'
+        return '\n'.join(wrapped) if wrapped else str(name)
+
+    labels = [_wrap_policy(b.get('key', '')) for b in rev]
+    values = [round(b.get('doc_count', 0) / total * 100, 1) for b in rev]
+    n = len(labels)
+    width = 500
+    height = 300#380
+    drawing = Drawing(width, height)
+    drawing.add(Rect(0, 0, width, height, fillColor=BG_FRAME, strokeColor=None))
+    chart = HorizontalBarChart()
+    chart.x = 110
+    chart.y = 50
+    chart.width = width - 130#100
+    chart.height = height - 75
+    chart.data = [values]
+    chart.bars[0].fillColor = ACCENT_BLUE
+    chart.bars[0].strokeColor = ACCENT_BLUE
+    chart.barWidth = max(2, (chart.width / max(n, 1)) * 0.6)
+    chart.groupSpacing = 4
+    chart.valueAxis.valueMin = 0
+    chart.valueAxis.valueMax = max(values) * 1.15 if values else 1
+    chart.valueAxis.valueStep = max(1, round(chart.valueAxis.valueMax / 5))
+    chart.valueAxis.labelTextFormat = '%d%%'
+    chart.valueAxis.labels.fontName = font_name
+    chart.valueAxis.labels.fontSize = 7
+    chart.valueAxis.labels.fillColor = TEXT_MUTED
+    chart.valueAxis.strokeColor = GRID_COLOR
+    chart.valueAxis.gridStrokeColor = GRID_COLOR
+    chart.categoryAxis.categoryNames = labels
+    chart.categoryAxis.labels.fontName = font_name
+    chart.categoryAxis.labels.fontSize = 7
+    chart.categoryAxis.labels.fillColor = TEXT_MUTED
+    chart.categoryAxis.labels.boxAnchor = 'ne'
+    chart.categoryAxis.labels.dy = 2
+    chart.categoryAxis.strokeColor = GRID_COLOR
+    drawing.add(chart)
+    return drawing
+
+
+def _build_pie_drawing(buckets, font_name):
+    """Pie chart Drawing where each slice is a top-IP attack count.
+
+    Slice size = bucket['doc_count']; percent label = count / total * 100.
+    Returns None if there are no buckets with a positive count.
+    """
+    counts = []
+    for b in buckets:
+        ip = b.get('key')
+        if ip == '0.0.0.0':
+            continue
+        c = b.get('doc_count', 0)
+        if not c:
+            continue
+        counts.append(c)
+    if not counts:
+        return None
+
+    total = sum(counts)
+    width = 280
+    height = 220
+    drawing = Drawing(width, height)
+    drawing.add(Rect(0, 0, width, height, fillColor=BG_FRAME, strokeColor=None))
+
+    pie = Pie()
+    pie.x = 30
+    pie.y = 25
+    pie.width = 170
+    pie.height = 170
+    pie.data = counts
+    pie.labels = [f"{(c / total * 100):.0f}%" for c in counts]
+    pie.simpleLabels = 1
+    pie.sideLabels = 0
+    for i in range(len(counts)):
+        color = _PIE_COLORS[i % len(_PIE_COLORS)]
+        pie.slices[i].fillColor = color
+        pie.slices[i].strokeColor = BG_FRAME
+        pie.slices[i].strokeWidth = 1
+        pie.slices[i].labelRadius = 0.65
+        pie.slices[i].fontName = font_name
+        pie.slices[i].fontSize = 7
+        pie.slices[i].fontColor = TEXT_MAIN
+    drawing.add(pie)
+    return drawing
+
+
+def _build_top_resources_widget(buckets, font_name, styles):
+    """Side-by-side: list of 'IP (resolved_name)' on the left, pie chart
+    (percent from doc_count / sum) on the right. Each list row carries a
+    small color swatch cell whose color matches the corresponding pie
+    slice."""
+    cell_style = _kv_cell_style(font_name)
+
+    filtered = []
+    for b in buckets:
+        ip = b.get('key')
+        if ip == '0.0.0.0':
+            continue
+        c = b.get('doc_count', 0)
+        if not c:
+            continue
+        resolved = resolve_ip(ip)
+        label = f"{ip} ({resolved})"
+        filtered.append(label)
+
+    if filtered:
+        rows = [[Paragraph('', cell_style),
+                 _to_paragraph(label, font_name, cell_style)]
+                for label in filtered]
+        list_tbl = Table(rows, colWidths=[16, 274])
+        list_style = TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.5, GRID_COLOR),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('LEFTPADDING', (0, 0), (0, -1), 4),
+            ('RIGHTPADDING', (0, 0), (0, -1), 4),
+            ('TOPPADDING', (0, 0), (0, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (0, -1), 3),
+            ('LEFTPADDING', (1, 0), (1, -1), 6),
+            ('RIGHTPADDING', (1, 0), (1, -1), 6),
+            ('TOPPADDING', (1, 0), (1, -1), 3),
+            ('BOTTOMPADDING', (1, 0), (1, -1), 3),
+        ])
+        for i in range(len(rows)):
+            color = _PIE_COLORS[i % len(_PIE_COLORS)]
+            list_style.add('BACKGROUND', (0, i), (0, i), color)
+            bg = BG_ROW_ODD if i % 2 == 1 else BG_ROW_EVEN
+            list_style.add('BACKGROUND', (1, i), (1, i), bg)
+        list_tbl.setStyle(list_style)
+        left_flowable = list_tbl
+    else:
+        left_flowable = Paragraph(STR_NO_DATA, styles['Normal'])
+
+    pie_drawing = _build_pie_drawing(buckets, font_name)
+    if pie_drawing is None:
+        right_flowable = Paragraph(STR_NO_DATA, styles['Normal'])
+    else:
+        right_flowable = pie_drawing
+
+    outer = Table([[left_flowable, right_flowable]], colWidths=[300, 280])
+    outer.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('TOPPADDING', (0, 0), (-1, -1), 0),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    return outer
+
+
+def _fetch_top_sources(start, end, size=11):
+    """Top attack source IPs by document count over the DP index patterns
+    (*radwarevision*, *antiddos*). Mirrors get_top_radware_summary exactly
+    except the aggregation is on ipsrc.keyword instead of ipdst.keyword.
+    Returns a list of {'key','doc_count'} buckets."""
+    time_filter = {"range": {"@timestamp": time_to_filter(start, end)}}
+
+    res = opensearch_client.search(index="*radwarevision*,*antiddos*", body={
+        "size": 0,
+        "query": {
+            "bool": {
+                "filter": [
+                    time_filter,
+                    {"term": {"action.keyword": "drop"}}
+                ]
+            }
+        },
+        "aggs": {
+            "top_ipsrc": {
+                "terms": {
+                    "field": "ipsrc.keyword",
+                    "size": size,
+                    "order": {"_count": "desc"}
+                }
+            }
+        }
+    })
+
+    return res['aggregations']['top_ipsrc']['buckets']
+
+
+def _build_top_sources_widget(buckets, font_name, styles):
+    """Same layout as _build_top_resources_widget (left: list of IPs with
+    color swatches, right: pie chart of doc_count share) but does NOT
+    resolve the source IPs to hostnames — only the raw IP is shown."""
+    cell_style = _kv_cell_style(font_name)
+
+    filtered = []
+    for b in buckets:
+        ip = b.get('key')
+        if ip == '0.0.0.0':
+            continue
+        c = b.get('doc_count', 0)
+        if not c:
+            continue
+        filtered.append(str(ip))
+
+    if filtered:
+        rows = [[Paragraph('', cell_style),
+                 _to_paragraph(label, font_name, cell_style)]
+                for label in filtered]
+        list_tbl = Table(rows, colWidths=[16, 274])
+        list_style = TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.5, GRID_COLOR),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('LEFTPADDING', (0, 0), (0, -1), 4),
+            ('RIGHTPADDING', (0, 0), (0, -1), 4),
+            ('TOPPADDING', (0, 0), (0, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (0, -1), 3),
+            ('LEFTPADDING', (1, 0), (1, -1), 6),
+            ('RIGHTPADDING', (1, 0), (1, -1), 6),
+            ('TOPPADDING', (1, 0), (1, -1), 3),
+            ('BOTTOMPADDING', (1, 0), (1, -1), 3),
+        ])
+        for i in range(len(rows)):
+            color = _PIE_COLORS[i % len(_PIE_COLORS)]
+            list_style.add('BACKGROUND', (0, i), (0, i), color)
+            bg = BG_ROW_ODD if i % 2 == 1 else BG_ROW_EVEN
+            list_style.add('BACKGROUND', (1, i), (1, i), bg)
+        list_tbl.setStyle(list_style)
+        left_flowable = list_tbl
+    else:
+        left_flowable = Paragraph(STR_NO_DATA, styles['Normal'])
+
+    pie_drawing = _build_pie_drawing(buckets, font_name)
+    if pie_drawing is None:
+        right_flowable = Paragraph(STR_NO_DATA, styles['Normal'])
+    else:
+        right_flowable = pie_drawing
+
+    outer = Table([[left_flowable, right_flowable]], colWidths=[300, 280])
+    outer.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('TOPPADDING', (0, 0), (-1, -1), 0),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    return outer
+
+
+def build_reports_pdf_alt(start_iso, end_iso):
+    _ensure_cyrillic_font()
+    font_name = 'Cyrillic' if 'Cyrillic' in pdfmetrics.getRegisteredFontNames() else 'Helvetica'
+
+    start_str = start_iso.replace('T', ' ')
+    end_str = end_iso.replace('T', ' ')
+    time_range_str = f"{start_str}  ->  {end_str}"
+
+    b2b_full = get_b2b_summary(start_iso, end_iso)
+    vc_it = get_vc_it_genie_summary(start_iso, end_iso)
+    shpd = get_shpd_genie_summary(start_iso, end_iso)
+
+    total = b2b_full.get('total_genie_events')
+    vc_count = b2b_full.get('vc_it_it_pe_events')
+    b2b_count = b2b_full.get('total_b2b_events')
+    fttb_count = b2b_full.get('fttb_events')
+
+    vc_biggest = _normalize_attack_record(vc_it.get('biggest_attack_by_bps'))
+    vc_longest = _normalize_attack_record(vc_it.get('longest_attack_by_duration'))
+    b2b_biggest = _normalize_attack_record(b2b_full.get('biggest_attack_by_bps'))
+    b2b_longest = _normalize_attack_record(b2b_full.get('longest_attack_by_duration'))
+    fttb_biggest = _normalize_attack_record(shpd.get('biggest_attack_by_bps'))
+    fttb_longest = _normalize_attack_record(shpd.get('longest_attack_by_duration'))
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            topMargin=40, bottomMargin=40,
+                            leftMargin=40, rightMargin=40)
+    styles = _cyr_styles()
+    story = []
+
+    story.append(Paragraph(STR_TITLE, styles['Heading1']))
+    story.append(Paragraph(f"{STR_TIME_RANGE}: {time_range_str}", styles['Muted']))
+    story.append(Spacer(1, 12))
+
+    story.append(_build_summary_grid_table(
+        total, vc_count, b2b_count, fttb_count,
+        vc_biggest, vc_longest,
+        b2b_biggest, b2b_longest,
+        fttb_biggest, fttb_longest,
+        font_name,
+    ))
+    story.append(Spacer(1, 16))
+
+    #story.append(Paragraph(STR_SIGNIFICANT_ACTIVITIES, styles['Heading3']))
+    #story.append(Spacer(1, 4))
+    #story.append(_build_empty_activities_table(font_name))
+    #story.append(Spacer(1, 16))
+
+    story.append(PageBreak())
+    story.append(Paragraph(STR_TOP_RESOURCES, styles['Heading3']))
+    story.append(Spacer(1, 4))
+    radware_top = get_top_radware_summary(start_str, end_str)
+    story.append(_build_top_resources_widget(radware_top, font_name, styles))
+    story.append(Spacer(1, 16))
+
+    story.append(Paragraph(STR_TOP_SOURCES, styles['Heading3']))
+    story.append(Spacer(1, 4))
+    src_buckets = _fetch_top_sources(start_str, end_str)
+    story.append(_build_top_sources_widget(src_buckets, font_name, styles))
+    story.append(Spacer(1, 16))
+
+    story.append(PageBreak())
+
+    story.append(Paragraph(STR_TOP_POLICIES, styles['Heading3']))
+    story.append(Spacer(1, 4))
+    pol_buckets = get_top_policies_summary(start_str, end_str)
+    if pol_buckets:
+        story.append(_build_policies_hist_drawing(pol_buckets, font_name))
+    else:
+        story.append(Paragraph(STR_NO_DATA, styles['Normal']))
+    story.append(Spacer(1, 16))
+
+    #story.append(PageBreak())
+    story.append(Paragraph(STR_TOP_DURATION, styles['Heading3']))
+    story.append(Spacer(1, 4))
+    dur_bins = _fetch_all_duration_histogram(start_iso, end_iso)
+    if dur_bins:
+        dur_rows = [[b.get('label', ''), f"{b.get('pkt', 0)}%"] for b in dur_bins]
+        #story.append(_grid_table([STR_BIN, STR_PCT_TOTAL], dur_rows,
+        #                          font_name, colWidths=[220, 280]))
+        story.append(Spacer(1, 4))
+        story.append(_build_duration_hist_drawing(dur_bins, font_name))
+    else:
+        story.append(Paragraph(STR_NO_DATA, styles['Normal']))
+
+    story.append(Paragraph(STR_TOP_BPS, styles['Heading3']))
+    story.append(Spacer(1, 4))
+    bps_bins = _fetch_all_bps_histogram(start_iso, end_iso)
+    if bps_bins:
+        story.append(Spacer(1, 4))
+        story.append(_build_bps_hist_drawing(bps_bins, font_name))
+    else:
+        story.append(Paragraph(STR_NO_DATA, styles['Normal']))
+
+    doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+

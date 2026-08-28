@@ -1,0 +1,1 @@
+venv/bin/gunicorn alert_center.app:app --bind 0.0.0.0:8000  --keyfile /export/home/lvelueta/alert_center/certs/private_key.pem --workers 3 --certfile /export/home/lvelueta/alert_center/certs/CRQ503072_AC.crt
