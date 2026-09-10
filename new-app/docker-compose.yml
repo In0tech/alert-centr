@@ -1,4 +1,24 @@
 services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-alert_center}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-alert_center}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change-me}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./deploy/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user $$CLICKHOUSE_USER --password $$CLICKHOUSE_PASSWORD --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   backend:
     build: ./backend
     env_file: .env
@@ -6,7 +26,9 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
-      - ../alert_center.conf:/app/config/alert_center.conf:ro
+    depends_on:
+      clickhouse:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -19,3 +41,6 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  clickhouse_data:
