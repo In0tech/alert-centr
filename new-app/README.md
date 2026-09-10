@@ -34,21 +34,96 @@ Swagger: `http://localhost:8000/docs`.
 
 Frontend поддерживает `dark` и `light` темы. Переключатель расположен в заголовке. Выбор сохраняется в `localStorage`; при первом запуске используется системная тема браузера. Дизайн сохраняет структуру и визуальный язык предоставленного прототипа Alert Centre.
 
+## Основная инструкция по установке
+
+Для серверной установки используйте:
+
+[`docs/installation.md`](docs/installation.md)
+
+В ней подробно описаны:
+
+- получение и обновление `main` с Git;
+- первоначальное клонирование приватного репозитория;
+- SSH-доступ GitHub;
+- подготовка Ubuntu 26.04 LTS (Resolute);
+- установка Docker Engine и Docker Compose;
+- отдельная установка Docker из России через зеркало официального Docker APT-репозитория Yandex;
+- действия при недоступности Docker Hub и использование собственного/Yandex Container Registry;
+- запуск всего приложения через Docker Compose;
+- обновление и полная пересборка контейнеров после `git pull`;
+- запуск backend без Docker;
+- запуск frontend без Docker;
+- установка и настройка SQLite без Docker;
+- запуск и инициализация ClickHouse без Docker;
+- systemd unit для FastAPI backend;
+- Nginx для production frontend и проксирования `/api/`;
+- проверка API, портов и логов;
+- типовые ошибки и production checklist.
+
 ## Быстрый запуск Docker
 
+Если Docker уже установлен:
+
 ```bash
+cd /opt/alert-centr
+git fetch origin
+git checkout main
+git pull origin main
+
 cd new-app
+
+# только при первом запуске
 cp .env.example .env
-# обязательно измените CLICKHOUSE_PASSWORD и APP_SECRET_KEY
+nano .env
+
 docker compose up --build -d
+docker compose ps
 ```
 
 После запуска:
 
-- frontend: `http://localhost:8080`
-- backend API: `http://localhost:8000`
-- Swagger: `http://localhost:8000/docs`
-- ClickHouse HTTP: `http://localhost:8123`
+- frontend: `http://SERVER_IP:8080`
+- backend API: `http://SERVER_IP:8000`
+- Swagger: `http://SERVER_IP:8000/docs`
+- ClickHouse HTTP: `http://SERVER_IP:8123` (не рекомендуется публиковать наружу в production).
+
+Проверка:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/api/v1/alerts
+curl http://127.0.0.1:8000/api/v1/mitigations
+curl http://127.0.0.1:8000/api/v1/metrics/summary
+```
+
+## Обновление существующего сервера
+
+Обычный вариант:
+
+```bash
+cd /opt/alert-centr
+git checkout main
+git pull origin main
+
+cd new-app
+docker compose down
+docker compose build --no-cache
+docker compose up -d
+docker compose ps
+```
+
+Если сервер должен полностью соответствовать Git и локальные изменения не нужны:
+
+```bash
+cd /opt/alert-centr
+git fetch origin
+git checkout main
+git reset --hard origin/main
+```
+
+> `git reset --hard` удаляет незакоммиченные локальные изменения.
+
+Если `.env` уже настроен, не выполняйте повторно `cp .env.example .env` — иначе вы перезапишете локальные секреты и адреса БД.
 
 ## Подготовка реальных SQLite БД
 
@@ -61,48 +136,40 @@ data/
 └── kuma_status.db
 ```
 
-Backend видит этот каталог как `/app/data`.
+Backend в Docker видит этот каталог как `/app/data`.
 
-Если файлов ещё нет, схемы и команды создания приведены в `docs/data-sources-and-installation.md`.
+Если файлов ещё нет, схемы и команды создания приведены в [`docs/data-sources-and-installation.md`](docs/data-sources-and-installation.md).
 
 ## Установка без Docker
 
-Для backend:
+Полная последовательность для Ubuntu 26.04 приведена в [`docs/installation.md`](docs/installation.md).
+
+Кратко backend:
 
 ```bash
-cd new-app/backend
+cd /opt/alert-centr/new-app/backend
 python3 -m venv .venv
 source .venv/bin/activate
-pip install --upgrade pip
+python -m pip install --upgrade pip
 pip install -e .
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Для frontend:
+Кратко frontend:
 
 ```bash
-cd new-app/frontend
+cd /opt/alert-centr/new-app/frontend
 npm install
-npm run dev
+VITE_API_URL=http://SERVER_IP:8000/api/v1 npm run build
 ```
+
+Для production готовую `frontend/dist/` рекомендуется отдавать через Nginx.
 
 ## Документация
 
-Главная подробная инструкция: [`docs/data-sources-and-installation.md`](docs/data-sources-and-installation.md).
-
-В ней описаны:
-
-- установка SQLite;
-- структура `alerts.db` и `mitigations.db`;
-- установка ClickHouse на Debian;
-- создание `genie_events`, `mitigations_events`, `kuma_events`;
-- пользователь и права ClickHouse;
-- переменные `.env`;
-- запуск backend/frontend;
-- Docker Compose;
-- перенос функций из старого `services/data_fetcher.py`;
-- различия старой и новой архитектуры;
-- production checklist.
+- [`docs/installation.md`](docs/installation.md) — установка, обновление, Ubuntu 26.04, Docker, Docker из России, manual deployment, systemd/Nginx и troubleshooting;
+- [`docs/data-sources-and-installation.md`](docs/data-sources-and-installation.md) — SQLite/ClickHouse, структуры таблиц, миграция `services/data_fetcher.py`, адаптеры и источники данных;
+- [`docs/architecture.md`](docs/architecture.md) — новая архитектура frontend/backend.
 
 ## Архитектура
 
