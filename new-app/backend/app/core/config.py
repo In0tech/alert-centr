@@ -18,7 +18,9 @@ class Settings(BaseSettings):
     clickhouse_password: str = "change-me"
     clickhouse_database: str = "alert_center"
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # When backend is started from new-app/backend, ../.env is the common
+    # application config. A local backend/.env may override it when needed.
+    model_config = SettingsConfigDict(env_file=("../.env", ".env"), extra="ignore")
 
     @property
     def allowed_origins(self) -> list[str]:
